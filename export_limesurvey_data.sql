@@ -2,32 +2,20 @@
 -- email: eltim.alves@gmail.com
 -- date: 14-12-2022
 --------------------------------------------------------------
-drop function if exists lime.export_limesurvey_data(integer);
-
-create function lime.export_limesurvey_data(p_surveyid integer)
-    returns TABLE(
-        id_response     integer,
-        id_survey       integer,
-        question_desc   text,
-        sub_question    character varying,
-        response_value  character varying,
-        qid_parent      integer,
-        q_order         integer,
-        inserted_at     timestamp with time zone,
-        title_response  character varying,
-        submitdate      timestamp,
-        customer_cpf    varchar(20))
-    language plpgsql
+--
+CREATE OR REPLACE LANGUAGE plpgsql;
+--
+CREATE OR REPLACE FUNCTION export_lime_data()
+    RETURNS TRIGGER language plpgsql
 AS
-$$
+$export_lime_data$
     DECLARE v_sid		        INT;
             v_gid		        INT;
             v_qid		        INT;
             v_type		        VARCHAR(1);
-            v_title		        VARCHAR(5);
+            v_title		        VARCHAR(10);
             v_question		    VARCHAR(500);
             v_question_order	INT;
-            v_survey_id_char	VARCHAR(50);
             v_table_name	    VARCHAR(50);
             v_parent_qid	    INT;
             v_column_name       VARCHAR(255);
@@ -36,20 +24,22 @@ $$
             v_response_value    VARCHAR(500);
             v_submitdate        TIMESTAMP;
             v_customer_cpf      VARCHAR(20);
+            v_response          varchar(500);
+            v_created_at        timestamptz;
+            v_sub_question      varchar(200);
 
     -- ## Cursors
     DECLARE curQuestions    refcursor;
             curResponses    refcursor;
             curSubQuestions refcursor;
             curCustomerCpf  refcursor;
+            curFinal        refcursor;
     BEGIN
-
+		v_table_name := TG_TABLE_NAME::regclass::text;
+        --
 		DROP TABLE IF EXISTS temp_result_data;
         DROP TABLE IF EXISTS temp_customer_cpf;
-
-		v_survey_id_char := CAST(p_surveyid AS VARCHAR(50));
-		v_table_name := 'lime.lime_survey_' || v_survey_id_char;
-
+		--
 		CREATE TEMPORARY TABLE temp_result_data(
 			id				    INT GENERATED ALWAYS AS IDENTITY(START WITH 1 INCREMENT BY 1) PRIMARY KEY NOT NULL,
 			response_id	        INT             NOT NULL,
@@ -77,12 +67,13 @@ $$
 					lql.question,
 					lq.question_order,
 					lq.parent_qid
-			FROM lime.lime_groups AS lg
-			INNER JOIN lime.lime_group_l10ns AS lgl ON lgl.gid = lg.gid
-			INNER JOIN lime.lime_questions AS lq ON lq.gid = lgl.gid
-			INNER JOIN lime.lime_question_l10ns AS lql ON lql.qid = lq.qid
-			WHERE lq.gid = lgl.gid AND lq.parent_qid = 0
-			AND lq.type IN ('S','N', 'T')
+			FROM lime_groups AS lg
+			INNER JOIN lime_group_l10ns AS lgl ON lgl.gid = lg.gid
+			INNER JOIN lime_questions AS lq ON lq.gid = lgl.gid
+			INNER JOIN lime_question_l10ns AS lql ON lql.qid = lq.qid
+			WHERE lq.gid = lgl.gid
+			AND lq.parent_qid = 0
+			AND lq.sid = cast(substring(v_table_name from '(\d{6})$') as integer)
 			ORDER BY lq.question_order;
 		FETCH curQuestions INTO
 			v_sid,
@@ -95,35 +86,15 @@ $$
 		    v_parent_qid;
 		WHILE FOUND
 		LOOP
-            v_column_name := CAST(v_sid AS VARCHAR(100)) || 'X' || CAST(v_gid AS VARCHAR(100)) || 'X' || CAST(v_qid AS VARCHAR(100));
-            -- raise notice 'column: %', v_column_name;
-            --
-            DROP TABLE IF EXISTS lime.temp_responses;
-            -- get only finished survey
-			v_query := 'CREATE TABLE lime.temp_responses AS SELECT id, "' || v_column_name || '", submitdate FROM ' || v_table_name || ' WHERE submitdate IS NOT NULL';
-            EXECUTE (v_query);
-
-            OPEN curResponses FOR SELECT * FROM lime.temp_responses;
-            FETCH curResponses INTO
-                v_response_id,
-                v_response_value,
-                v_submitdate;
-            WHILE FOUND
-            LOOP
-                IF(v_title = 'CPF') THEN
-                    INSERT INTO temp_customer_cpf(response_id, cpf) VALUES(v_response_id, v_response_value);
-                    --raise notice 'cpf: %', v_response_value ||  ' id: '|| v_response_id;
+                IF(v_title = 'CPF' AND v_response_value IS NOT NULL) THEN
+                    INSERT INTO temp_customer_cpf(response_id, cpf) VALUES(NEW.id, v_response_value);
                 END IF;
 
-                INSERT INTO temp_result_data(response_id, survey_id, question, response, question_order, parent_qid, question_type, title, submit_date, cpf) VALUES(v_response_id,v_sid,v_question, v_response_value, v_question_order, v_parent_qid, v_type, v_title, v_submitdate, null);
-                FETCH curResponses INTO v_response_id, v_response_value, v_submitdate;
-            END LOOP;
-            CLOSE curResponses;
-            --
+                INSERT INTO temp_result_data(response_id, survey_id, question, response, question_order, parent_qid, question_type, title, submit_date, cpf) VALUES(NEW.id,v_sid,v_question, v_response_value, v_question_order, v_parent_qid, v_type, v_title, v_submitdate, null);
 		    FETCH curQuestions INTO v_sid, v_gid, v_qid, v_type, v_title, v_question, v_question_order;
 		END LOOP;
 		CLOSE curQuestions;
-
+        -- subQuestions
 		OPEN curSubQuestions FOR
 			SELECT	lq.sid,
 					lq.gid,
@@ -133,12 +104,13 @@ $$
 					lql.question,
 					lq.question_order,
 					lq.parent_qid
-			FROM lime.lime_groups AS lg
-			INNER JOIN lime.lime_group_l10ns AS lgl ON lgl.gid = lg.gid
-			INNER JOIN lime.lime_questions AS lq ON lq.gid = lgl.gid
-			INNER JOIN lime.lime_question_l10ns AS lql ON lql.qid = lq.qid
+			FROM lime_groups AS lg
+			INNER JOIN lime_group_l10ns AS lgl ON lgl.gid = lg.gid
+			INNER JOIN lime_questions AS lq ON lq.gid = lgl.gid
+			INNER JOIN lime_question_l10ns AS lql ON lql.qid = lq.qid
 			WHERE lq.gid = lgl.gid
-			AND lq.type IN ('F','M')
+			AND lq.parent_qid > 0
+			AND lq.sid = cast(substring(v_table_name from '(\d{6})$') as integer)
 			ORDER BY lq.question_order;
 		FETCH curSubQuestions INTO
 			v_sid,
@@ -151,35 +123,29 @@ $$
 		    v_parent_qid;
 		WHILE FOUND
 		LOOP
-		    IF(v_parent_qid > 0) THEN
-                v_column_name := CAST(v_sid AS VARCHAR(100)) || 'X' || CAST(v_gid AS VARCHAR(100)) || 'X' || CAST(v_parent_qid AS VARCHAR(100)) || CAST(v_title AS VARCHAR(5));
-
-                --
-                DROP TABLE IF EXISTS lime.temp_responses;
-                -- get only finished survey
-                v_query := 'CREATE TABLE lime.temp_responses AS SELECT id, "' || v_column_name || '", submitdate FROM ' || v_table_name || ' WHERE submitdate IS NOT NULL';
-                EXECUTE (v_query);
-
-                OPEN curResponses FOR SELECT * FROM lime.temp_responses;
-                FETCH curResponses INTO
-                    v_response_id,
-                    v_response_value,
-                    v_submitdate;
-                WHILE FOUND
-                LOOP
-                    INSERT INTO temp_result_data(response_id, survey_id, question, response, question_order, parent_qid, title, submit_date) VALUES(v_response_id,v_sid,v_question, v_response_value, v_question_order, v_parent_qid, v_title, v_submitdate);
-                    FETCH curResponses INTO v_response_id, v_response_value;
-                END LOOP;
-                CLOSE curResponses;
-            ELSE
-		        INSERT INTO temp_result_data(response_id, survey_id, question, response, question_order, parent_qid, title,submit_date) VALUES(0,v_sid,v_question, v_response_value, v_question_order, 0, v_title, v_submitdate);
-            END IF;
-
+            v_column_name := CAST(v_sid AS VARCHAR(100)) || 'X' || CAST(v_gid AS VARCHAR(100)) || 'X' || CAST(v_parent_qid AS VARCHAR(100)) || CAST(v_title AS VARCHAR(5));
+            --
+            DROP TABLE IF EXISTS temp_responses;
+            v_query := 'CREATE TABLE temp_responses AS SELECT id, "' || v_column_name || '", submitdate FROM ' || v_table_name || ' WHERE submitdate IS NOT NULL AND ' || ' id = ' || NEW.id;
+            EXECUTE (v_query);
+            --
+            OPEN curResponses FOR SELECT * FROM temp_responses;
+            FETCH curResponses INTO
+                v_response_id,
+                v_response_value,
+                v_submitdate;
+            WHILE FOUND
+            LOOP
+                INSERT INTO temp_result_data(response_id, survey_id, question, response, question_order, parent_qid, title, submit_date) VALUES(NEW.id,v_sid,v_question, v_response_value, v_question_order, v_parent_qid, v_title, v_submitdate);
+                FETCH curResponses INTO v_response_id, v_response_value;
+            END LOOP;
+            CLOSE curResponses;
+            --
 		    FETCH curSubQuestions INTO v_sid, v_gid, v_qid, v_type, v_title, v_question, v_question_order, v_parent_qid;
 		END LOOP;
 		CLOSE curSubQuestions;
         --
-		DROP TABLE IF EXISTS lime.temp_responses;
+		DROP TABLE IF EXISTS temp_responses;
 		--
 		OPEN curCustomerCpf FOR SELECT response_id, cpf FROM temp_customer_cpf;
 		    FETCH curCustomerCpf INTO
@@ -189,13 +155,14 @@ $$
 		    LOOP
                 UPDATE temp_result_data
                 SET cpf = v_customer_cpf
-                WHERE response_id = v_response_id;
+                WHERE response_id = NEW.id;
 
                 FETCH curCustomerCpf INTO v_response_id, v_customer_cpf;
             END LOOP;
 		CLOSE curCustomerCpf;
 		--
-        RETURN QUERY
+        --RETURN QUERY
+		OPEN curFinal FOR
             SELECT trd.response_id,
                    trd.survey_id,
                    lql.question,
@@ -212,7 +179,7 @@ $$
                    trd.submit_date,
                    trd.cpf
             FROM temp_result_data trd
-            INNER JOIN lime.lime_question_l10ns lql ON lql.qid = trd.parent_qid
+            INNER JOIN lime_question_l10ns lql ON lql.qid = trd.parent_qid
         UNION ALL
             SELECT response_id,
                    survey_id,
@@ -226,11 +193,33 @@ $$
                    submit_date,
                    cpf
             FROM temp_result_data
-            WHERE parent_qid = 0 AND question_type in ('S','N', 'T')
+            WHERE parent_qid = 0
             ORDER BY parent_qid, question_order;
+		FETCH curFinal INTO
+		    v_response_id,
+		    v_sid,
+		    v_question,
+		    v_response,
+		    v_sub_question,
+		    v_parent_qid,
+		    v_question_order,
+		    v_created_at,
+		    v_title,
+		    v_submitdate,
+		    v_customer_cpf;
+		WHILE FOUND
+		LOOP
+		    IF(NEW.submitdate IS NOT NULL) THEN
+                INSERT INTO lime_exported_data(id_response, id_survey, question_desc, sub_question, response_value, qid_parent, q_order, inserted_at, title_response, submitdate, customer_cpf)
+                    VALUES(NEW.id,v_sid,v_question,v_response,v_sub_question,v_parent_qid,v_question_order,v_created_at,v_title,v_submitdate,v_customer_cpf);
+            END IF;
+            FETCH curFinal INTO v_response_id,v_sid,v_question,v_response,v_sub_question,v_parent_qid,v_question_order,v_created_at,v_title,v_submitdate,v_customer_cpf;
+        END LOOP;
+		CLOSE curFinal;
 		--
+        RETURN NULL;
     END;
-$$;
+$export_lime_data$;
 
-alter function lime.export_limesurvey_data(integer) owner to postgres;
-
+alter function 
+export_lime_data() owner to postgres;
